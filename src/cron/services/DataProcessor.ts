@@ -57,9 +57,7 @@ export class DataProcessor {
     private async processTariffPeriodsAndRates(processedData: ProcessedData, trx: any): Promise<ProcessResult> {
         this.logger.info(`Processing tariff periods and rates for ${processedData.warehouses.length} warehouses`);
         
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
+        const now = new Date();
         
         let tariffPeriodsCount = 0;
         let boxRatesCount = 0;
@@ -74,7 +72,7 @@ export class DataProcessor {
             }
 
             // Находим текущий активный период для этого склада
-            const currentPeriod = await this.getCurrentPeriodForWarehouse(warehouse.id, today, trx);
+            const currentPeriod = await this.getCurrentPeriodForWarehouse(warehouse.id, now, trx);
             
             if (currentPeriod) {
                 // Проверяем, изменились ли тарифы для этого склада
@@ -90,16 +88,16 @@ export class DataProcessor {
                     boxRate.tariff_period_id = currentPeriod.id;
                     boxRate.warehouse_id = warehouse.id;
                     
-                    this.logger.info(`Extended period ${currentPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} until ${processedData.tariffPeriodEndDate.toISOString().split('T')[0]} - no new rates needed`);
+                    this.logger.info(`Extended period ${currentPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} until ${processedData.tariffPeriodEndDate.toISOString()} - no new rates needed`);
                 } else {
-                    // Тарифы изменились - закрываем старый период и создаем новый
+                    // Тарифы изменились - закрываем старый период текущим временем и создаем новый
                     await trx('tariff_periods')
                         .where('id', currentPeriod.id)
-                        .update({ end_date: yesterday });
+                        .update({ end_date: now });
                     
                     const [newPeriod] = await trx('tariff_periods')
                         .insert({
-                            start_date: today,
+                            start_date: now,
                             end_date: processedData.tariffPeriodEndDate
                         })
                         .returning('*');
@@ -111,13 +109,13 @@ export class DataProcessor {
                     tariffPeriodsCount++;
                     boxRatesCount++;
                     
-                    this.logger.info(`Closed period ${currentPeriod.id} and created new period ${newPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
+                    this.logger.info(`Closed period ${currentPeriod.id} at ${now.toISOString()} and created new period ${newPeriod.id} from ${now.toISOString()} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
                 }
             } else {
                 // Нет текущего периода для этого склада - создаем новый
                 const [newPeriod] = await trx('tariff_periods')
                     .insert({
-                        start_date: today,
+                        start_date: now,
                         end_date: processedData.tariffPeriodEndDate
                     })
                     .returning('*');
@@ -129,7 +127,7 @@ export class DataProcessor {
                 tariffPeriodsCount++;
                 boxRatesCount++;
                 
-                this.logger.info(`Created new period ${newPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
+                this.logger.info(`Created new period ${newPeriod.id} from ${now.toISOString()} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
             }
         }
 
@@ -143,14 +141,14 @@ export class DataProcessor {
         };
     }
 
-    private async getCurrentPeriodForWarehouse(warehouseId: string, today: Date, trx: any): Promise<any> {
+    private async getCurrentPeriodForWarehouse(warehouseId: string, now: Date, trx: any): Promise<any> {
         // Находим текущий активный период для конкретного склада
         const currentRate = await trx('box_rates')
             .join('tariff_periods', 'box_rates.tariff_period_id', 'tariff_periods.id')
             .where('box_rates.warehouse_id', warehouseId)
-            .where('tariff_periods.start_date', '<=', today)
+            .where('tariff_periods.start_date', '<=', now)
             .where(function(this: any) {
-                this.whereNull('tariff_periods.end_date').orWhere('tariff_periods.end_date', '>=', today);
+                this.whereNull('tariff_periods.end_date').orWhere('tariff_periods.end_date', '>=', now);
             })
             .select('tariff_periods.*')
             .first();

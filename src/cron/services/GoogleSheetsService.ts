@@ -176,11 +176,11 @@ export class GoogleSheetsService {
             return [["Нет актуальных тарифов"]];
         }
 
-        // Заголовки колонок (без ID, с удобными названиями)
         const headers = [
             "Регион",
             "Склад",
-            "Период действия",
+            "Дата начала",
+            "Дата окончания",
             "Логистика (₽/л)",
             "Логистика коэф",
             "Логистика доп (₽/л)",
@@ -196,7 +196,8 @@ export class GoogleSheetsService {
         const rows = data.map(row => [
             row.geo_name || "",
             row.warehouse_name || "",
-            this.formatPeriod(row.start_date, row.end_date),
+            this.formatDate(row.start_date),
+            this.formatEndDate(row.end_date),
             this.formatNumber(row.box_delivery_base),
             this.formatNumber(row.box_delivery_coef),
             this.formatNumber(row.box_delivery_liter),
@@ -212,30 +213,29 @@ export class GoogleSheetsService {
     }
 
     /**
-     * Форматирование периода действия тарифа
+     * Форматирование даты окончания (с датой и временем до минут)
      */
-    private formatPeriod(startDate: string, endDate: string | null): string {
-        if (!startDate) return "";
-        
-        const start = this.formatDate(startDate);
+    private formatEndDate(endDate: string | null): string {
         if (!endDate) {
-            return `с ${start}`;  // Бессрочный тариф
+            return "-";  // Бессрочный тариф
         }
         
-        const end = this.formatDate(endDate);
-        return `${start} - ${end}`;
+        return this.formatDate(endDate);
     }
 
     /**
-     * Форматирование даты в читаемый вид
+     * Форматирование даты и времени в читаемый вид (до минут)
      */
     private formatDate(dateString: string): string {
         try {
             const date = new Date(dateString);
-            return date.toLocaleDateString('ru-RU', {
+            return date.toLocaleString('ru-RU', {
                 day: '2-digit',
                 month: '2-digit', 
-                year: 'numeric'
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
             });
         } catch (error) {
             return dateString;  // Возвращаем как есть если не удалось распарсить
