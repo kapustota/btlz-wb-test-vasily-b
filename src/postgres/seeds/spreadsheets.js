@@ -12,11 +12,17 @@ const __dirname = dirname(__filename);
 export async function seed(knex) {
     // Читаем ID таблиц из JSON файла
     const configPath = process.env.GOOGLE_SPREADSHEETS_CONFIG_PATH;
+    
+    if (!configPath) {
+        console.log("GOOGLE_SPREADSHEETS_CONFIG_PATH not set, skipping spreadsheet seeds");
+        return;
+    }
+    
     const spreadsheetPath = join(__dirname, "../../../", configPath);
     const spreadsheetIds = JSON.parse(readFileSync(spreadsheetPath, "utf-8"));
 
     // Преобразуем в объекты для вставки
-    const spreadsheetData = spreadsheetIds.map((id) => ({
+    const spreadsheetData = spreadsheetIds.map((/** @type {string} */ id) => ({
         spreadsheet_id: id
     }));
 

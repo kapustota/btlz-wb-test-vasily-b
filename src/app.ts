@@ -15,7 +15,7 @@ try {
     logger.info("Database seeds completed");
 
     const cronSchedule = "0 * * * *";
-    logger.info(`Setting up cron job with schedule: ${cronSchedule} (daily at midnight)`);
+    logger.info(`Setting up cron job with schedule: ${cronSchedule} (hourly)`);
     
     cron.schedule(cronSchedule, async () => {
         logger.info("Cron job triggered: Starting rates synchronization...");
@@ -31,7 +31,7 @@ try {
     });
 
     logger.info("Application started successfully");
-    logger.info("Cron job is scheduled to run daily at midnight (Moscow time)");
+    logger.info("Cron job is scheduled to run hourly");
     
 } catch (error) {
     logger.error("Failed to start application:", error);

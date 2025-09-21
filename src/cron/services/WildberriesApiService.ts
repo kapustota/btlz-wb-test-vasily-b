@@ -48,7 +48,8 @@ export class WildberriesApiService {
 
         } catch (error) {
             this.logger.error("Error fetching data from Wildberries API:", error);
-            throw new Error(`Failed to fetch data from Wildberries API: ${error.message}`);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to fetch data from Wildberries API: ${errorMessage}`);
         }
     }
 
@@ -113,4 +114,3 @@ export interface WbWarehouseBoxRate {
     geoName: string;                           // Страна, для РФ — округ
     warehouseName: string;                     // Название склада
 }
-
