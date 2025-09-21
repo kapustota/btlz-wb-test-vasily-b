@@ -16,24 +16,15 @@ export class DataProcessor {
             try {
                 const processedData = this.convertWbDataToProcessedData(wbData);
                 
-                // Обрабатываем тарифный период и получаем информацию о том, нужны ли новые тарифы
-                const needsNewRates = await this.processTariffPeriod(processedData, trx);
-                
                 // Обрабатываем склады и заполняем их ID
                 await this.processWarehouses(processedData, trx);
                 
-                // Обрабатываем тарифы только если нужны новые
-                if (needsNewRates) {
-                    await this.processBoxRates(processedData, trx);
-                }
+                // Обрабатываем тарифные периоды и тарифы для каждого склада индивидуально
+                const result = await this.processTariffPeriodsAndRates(processedData, trx);
 
-                this.logger.info(`Successfully processed: 1 tariff period, ${processedData.warehouses.length} warehouses, ${needsNewRates ? processedData.boxRates.length : 0} box rates`);
+                this.logger.info(`Successfully processed: ${result.tariffPeriodsCount} tariff periods, ${processedData.warehouses.length} warehouses, ${result.boxRatesCount} box rates`);
                 
-                return {
-                    tariffPeriodsCount: 1,
-                    warehousesCount: processedData.warehouses.length,
-                    boxRatesCount: needsNewRates ? processedData.boxRates.length : 0
-                };
+                return result;
 
         } catch (error) {
                 this.logger.error("Error during data processing:", error);
@@ -59,143 +50,159 @@ export class DataProcessor {
                 box_storage_coef: Number(wbRate.boxStorageCoefExpr.replace(',', '.')),
                 box_storage_liter: Number(wbRate.boxStorageLiter.replace(',', '.')),
             })),
-            tariffPeriod: {
-                start_date: new Date(),
-                end_date: new Date(wbData.dtTillMax)
-            }
+            tariffPeriodEndDate: new Date(wbData.dtTillMax)
         };
     }
 
-    private async processTariffPeriod(processedData: ProcessedData, trx: any): Promise<boolean> {
-        this.logger.info(`Processing tariff period with end date: ${processedData.tariffPeriod.end_date?.toISOString()}`);
+    private async processTariffPeriodsAndRates(processedData: ProcessedData, trx: any): Promise<ProcessResult> {
+        this.logger.info(`Processing tariff periods and rates for ${processedData.warehouses.length} warehouses`);
         
         const today = new Date();
         const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
+        
+        let tariffPeriodsCount = 0;
+        let boxRatesCount = 0;
 
-        const currentPeriod = await trx('tariff_periods')
-            .where('start_date', '<=', today)
-            .where(function(this: any) {
-                this.whereNull('end_date').orWhere('end_date', '>=', today);
-            })
-            .first();
+        for (let i = 0; i < processedData.warehouses.length; i++) {
+            const warehouse = processedData.warehouses[i];
+            const boxRate = processedData.boxRates[i];
 
-        if (currentPeriod) {
-            const ratesMatch = await this.checkRatesMatch(currentPeriod.id, processedData, trx);
+            if (!warehouse.id) {
+                this.logger.warn(`Missing warehouse ID at index ${i}`);
+                continue;
+            }
+
+            // Находим текущий активный период для этого склада
+            const currentPeriod = await this.getCurrentPeriodForWarehouse(warehouse.id, today, trx);
             
-            if (ratesMatch) {
-                // Тарифы совпадают - просто обновляем end_date, новые тарифы не нужны
-                await trx('tariff_periods')
-                    .where('id', currentPeriod.id)
-                    .update({ end_date: processedData.tariffPeriod.end_date });
+            if (currentPeriod) {
+                // Проверяем, изменились ли тарифы для этого склада
+                const ratesMatch = await this.checkRatesMatchForWarehouse(currentPeriod.id, warehouse.id, boxRate, trx);
                 
-                processedData.tariffPeriod.id = currentPeriod.id;
-                processedData.tariffPeriod.start_date = new Date(currentPeriod.start_date);
-                
-                this.logger.info(`Updated existing period ${currentPeriod.id} end date to ${processedData.tariffPeriod.end_date?.toISOString().split('T')[0]} - no new rates needed`);
-                return false; // Новые тарифы не нужны
+                if (ratesMatch) {
+                    // Тарифы не изменились - продлеваем текущий период
+                    await trx('tariff_periods')
+                        .where('id', currentPeriod.id)
+                        .update({ end_date: processedData.tariffPeriodEndDate });
+                    
+                    // Связываем тариф с существующим периодом
+                    boxRate.tariff_period_id = currentPeriod.id;
+                    boxRate.warehouse_id = warehouse.id;
+                    
+                    this.logger.info(`Extended period ${currentPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} until ${processedData.tariffPeriodEndDate.toISOString().split('T')[0]} - no new rates needed`);
+                } else {
+                    // Тарифы изменились - закрываем старый период и создаем новый
+                    await trx('tariff_periods')
+                        .where('id', currentPeriod.id)
+                        .update({ end_date: yesterday });
+                    
+                    const [newPeriod] = await trx('tariff_periods')
+                        .insert({
+                            start_date: today,
+                            end_date: processedData.tariffPeriodEndDate
+                        })
+                        .returning('*');
+                    
+                    // Связываем тариф с новым периодом
+                    boxRate.tariff_period_id = newPeriod.id;
+                    boxRate.warehouse_id = warehouse.id;
+                    
+                    tariffPeriodsCount++;
+                    boxRatesCount++;
+                    
+                    this.logger.info(`Closed period ${currentPeriod.id} and created new period ${newPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
+                }
             } else {
-                // Тарифы не совпадают - закрываем старый период и создаем новый
-                await trx('tariff_periods')
-                    .where('id', currentPeriod.id)
-                    .update({ end_date: yesterday });
-                
+                // Нет текущего периода для этого склада - создаем новый
                 const [newPeriod] = await trx('tariff_periods')
                     .insert({
                         start_date: today,
-                        end_date: processedData.tariffPeriod.end_date
+                        end_date: processedData.tariffPeriodEndDate
                     })
                     .returning('*');
                 
-                processedData.tariffPeriod.id = newPeriod.id;
-                processedData.tariffPeriod.start_date = today;
+                // Связываем тариф с новым периодом
+                boxRate.tariff_period_id = newPeriod.id;
+                boxRate.warehouse_id = warehouse.id;
                 
-                this.logger.info(`Closed period ${currentPeriod.id} at ${yesterday.toISOString().split('T')[0]}, created new period ${newPeriod.id} from ${today.toISOString().split('T')[0]} to ${processedData.tariffPeriod.end_date?.toISOString().split('T')[0]} - new rates needed`);
-                return true; // Новые тарифы нужны
+                tariffPeriodsCount++;
+                boxRatesCount++;
+                
+                this.logger.info(`Created new period ${newPeriod.id} for warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} - new rates needed`);
             }
-        } else {
-            // Нет текущего периода - создаем новый
-            const [newPeriod] = await trx('tariff_periods')
-                .insert({
-                    start_date: today,
-                    end_date: processedData.tariffPeriod.end_date
-                })
-                .returning('*');
-            
-            processedData.tariffPeriod.id = newPeriod.id;
-            processedData.tariffPeriod.start_date = today;
-            
-            this.logger.info(`Created new period ${newPeriod.id} from ${today.toISOString().split('T')[0]} to ${processedData.tariffPeriod.end_date?.toISOString().split('T')[0]} - new rates needed`);
-            return true; // Новые тарифы нужны
         }
+
+        // Сохраняем все тарифы (как новые, так и обновленные)
+        await this.saveBoxRates(processedData, trx);
+
+        return {
+            tariffPeriodsCount,
+            warehousesCount: processedData.warehouses.length,
+            boxRatesCount
+        };
     }
 
-    private async checkRatesMatch(periodId: string, processedData: ProcessedData, trx: any): Promise<boolean> {
-        this.logger.info(`Checking rates match for period ${periodId}`);
+    private async getCurrentPeriodForWarehouse(warehouseId: string, today: Date, trx: any): Promise<any> {
+        // Находим текущий активный период для конкретного склада
+        const currentRate = await trx('box_rates')
+            .join('tariff_periods', 'box_rates.tariff_period_id', 'tariff_periods.id')
+            .where('box_rates.warehouse_id', warehouseId)
+            .where('tariff_periods.start_date', '<=', today)
+            .where(function(this: any) {
+                this.whereNull('tariff_periods.end_date').orWhere('tariff_periods.end_date', '>=', today);
+            })
+            .select('tariff_periods.*')
+            .first();
+
+        return currentRate;
+    }
+
+    private async checkRatesMatchForWarehouse(periodId: string, warehouseId: string, newRate: ProcessedBoxRate, trx: any): Promise<boolean> {
+        this.logger.info(`Checking rates match for period ${periodId} and warehouse ${warehouseId}`);
     
-        const existingRates = await trx('box_rates')
-            .join('warehouses', 'box_rates.warehouse_id', 'warehouses.id')
-            .where('box_rates.tariff_period_id', periodId)
+        const existingRate = await trx('box_rates')
+            .where('tariff_period_id', periodId)
+            .where('warehouse_id', warehouseId)
             .select(
-                'warehouses.geo_name',
-                'warehouses.warehouse_name',
-                knex.raw('box_rates.box_delivery_base::float as box_delivery_base'),
-                knex.raw('box_rates.box_delivery_coef::float as box_delivery_coef'),
-                knex.raw('box_rates.box_delivery_liter::float as box_delivery_liter'),
-                knex.raw('box_rates.box_delivery_marketplace_base::float as box_delivery_marketplace_base'),
-                knex.raw('box_rates.box_delivery_marketplace_coef::float as box_delivery_marketplace_coef'),
-                knex.raw('box_rates.box_delivery_marketplace_liter::float as box_delivery_marketplace_liter'),
-                knex.raw('box_rates.box_storage_base::float as box_storage_base'),
-                knex.raw('box_rates.box_storage_coef::float as box_storage_coef'),
-                knex.raw('box_rates.box_storage_liter::float as box_storage_liter')
-            );
+                knex.raw('box_delivery_base::float as box_delivery_base'),
+                knex.raw('box_delivery_coef::float as box_delivery_coef'),
+                knex.raw('box_delivery_liter::float as box_delivery_liter'),
+                knex.raw('box_delivery_marketplace_base::float as box_delivery_marketplace_base'),
+                knex.raw('box_delivery_marketplace_coef::float as box_delivery_marketplace_coef'),
+                knex.raw('box_delivery_marketplace_liter::float as box_delivery_marketplace_liter'),
+                knex.raw('box_storage_base::float as box_storage_base'),
+                knex.raw('box_storage_coef::float as box_storage_coef'),
+                knex.raw('box_storage_liter::float as box_storage_liter')
+            )
+            .first();
 
-        if (existingRates.length === 0) {
-            this.logger.info(`No existing rates found for period ${periodId} - rates don't match`);
+        if (!existingRate) {
+            this.logger.info(`No existing rate found for period ${periodId} and warehouse ${warehouseId} - rates don't match`);
             return false;
         }
 
-        if (existingRates.length !== processedData.boxRates.length) {
-            this.logger.info(`Rate count mismatch: DB has ${existingRates.length}, processed has ${processedData.boxRates.length} - rates don't match`);
-            return false;
-        }
+        // Сравниваем все числовые поля (с точностью до 2 знаков после запятой)
+        const fieldsToCompare = [
+            { processed: newRate.box_delivery_base, db: existingRate.box_delivery_base, name: 'box_delivery_base' },
+            { processed: newRate.box_delivery_coef, db: existingRate.box_delivery_coef, name: 'box_delivery_coef' },
+            { processed: newRate.box_delivery_liter, db: existingRate.box_delivery_liter, name: 'box_delivery_liter' },
+            { processed: newRate.box_delivery_marketplace_base, db: existingRate.box_delivery_marketplace_base, name: 'box_delivery_marketplace_base' },
+            { processed: newRate.box_delivery_marketplace_coef, db: existingRate.box_delivery_marketplace_coef, name: 'box_delivery_marketplace_coef' },
+            { processed: newRate.box_delivery_marketplace_liter, db: existingRate.box_delivery_marketplace_liter, name: 'box_delivery_marketplace_liter' },
+            { processed: newRate.box_storage_base, db: existingRate.box_storage_base, name: 'box_storage_base' },
+            { processed: newRate.box_storage_coef, db: existingRate.box_storage_coef, name: 'box_storage_coef' },
+            { processed: newRate.box_storage_liter, db: existingRate.box_storage_liter, name: 'box_storage_liter' }
+        ];
 
-        for (let i = 0; i < processedData.boxRates.length; i++) {
-            const processedRate = processedData.boxRates[i];
-            const warehouse = processedData.warehouses[i];
-            
-            const existingRate = existingRates.find((rate: any) => 
-                rate.geo_name === warehouse.geo_name && 
-                rate.warehouse_name === warehouse.warehouse_name
-            );
-
-            if (!existingRate) {
-                this.logger.info(`Warehouse ${warehouse.geo_name} - ${warehouse.warehouse_name} not found in existing rates - rates don't match`);
+        for (const field of fieldsToCompare) {
+            if (Math.abs(field.processed - field.db) > 0.01) { // Точность до 2 знаков
+                this.logger.info(`Rate mismatch for warehouse ${warehouseId}: ${field.name} processed=${field.processed}, DB=${field.db} - rates don't match`);
                 return false;
             }
-
-            // Сравниваем все числовые поля (с точностью до 2 знаков после запятой)
-            const fieldsToCompare = [
-                { processed: processedRate.box_delivery_base, db: existingRate.box_delivery_base, name: 'box_delivery_base' },
-                { processed: processedRate.box_delivery_coef, db: existingRate.box_delivery_coef, name: 'box_delivery_coef' },
-                { processed: processedRate.box_delivery_liter, db: existingRate.box_delivery_liter, name: 'box_delivery_liter' },
-                { processed: processedRate.box_delivery_marketplace_base, db: existingRate.box_delivery_marketplace_base, name: 'box_delivery_marketplace_base' },
-                { processed: processedRate.box_delivery_marketplace_coef, db: existingRate.box_delivery_marketplace_coef, name: 'box_delivery_marketplace_coef' },
-                { processed: processedRate.box_delivery_marketplace_liter, db: existingRate.box_delivery_marketplace_liter, name: 'box_delivery_marketplace_liter' },
-                { processed: processedRate.box_storage_base, db: existingRate.box_storage_base, name: 'box_storage_base' },
-                { processed: processedRate.box_storage_coef, db: existingRate.box_storage_coef, name: 'box_storage_coef' },
-                { processed: processedRate.box_storage_liter, db: existingRate.box_storage_liter, name: 'box_storage_liter' }
-            ];
-
-            for (const field of fieldsToCompare) {
-                if (Math.abs(field.processed - field.db) > 0.01) { // Точность до 2 знаков
-                    this.logger.info(`Rate mismatch for ${warehouse.geo_name} - ${warehouse.warehouse_name}: ${field.name} processed=${field.processed}, DB=${field.db} - rates don't match`);
-                    return false;
-                }
-            }
         }
 
-        this.logger.info(`All rates match for period ${periodId}`);
+        this.logger.info(`Rates match for period ${periodId} and warehouse ${warehouseId}`);
         return true;
     }
 
@@ -229,22 +236,20 @@ export class DataProcessor {
         }
     }
 
-    private async processBoxRates(processedData: ProcessedData, trx: any): Promise<void> {
-        this.logger.info(`Processing box rates for ${processedData.boxRates.length} warehouses`);
+    private async saveBoxRates(processedData: ProcessedData, trx: any): Promise<void> {
+        this.logger.info(`Saving box rates for ${processedData.boxRates.length} warehouses`);
 
         for (let i = 0; i < processedData.boxRates.length; i++) {
             const boxRate = processedData.boxRates[i];
-            const warehouse = processedData.warehouses[i];
-            const tariffPeriod = processedData.tariffPeriod;
 
-            if (!warehouse.id || !tariffPeriod.id) {
+            if (!boxRate.warehouse_id || !boxRate.tariff_period_id) {
                 this.logger.warn(`Missing IDs for warehouse or tariff period at index ${i}`);
                 continue;
             }
 
             const boxRateData = {
-                warehouse_id: warehouse.id,
-                tariff_period_id: tariffPeriod.id,
+                warehouse_id: boxRate.warehouse_id,
+                tariff_period_id: boxRate.tariff_period_id,
                 box_delivery_base: boxRate.box_delivery_base,
                 box_delivery_coef: boxRate.box_delivery_coef,
                 box_delivery_liter: boxRate.box_delivery_liter,
@@ -264,8 +269,6 @@ export class DataProcessor {
 
             // Заполняем ID в processedData
             boxRate.id = savedBoxRate.id;
-            boxRate.warehouse_id = savedBoxRate.warehouse_id;
-            boxRate.tariff_period_id = savedBoxRate.tariff_period_id;
         }
     }
 }
@@ -285,19 +288,13 @@ export interface ProcessResult {
 export interface ProcessedData {
     warehouses: ProcessedWarehouse[];
     boxRates: ProcessedBoxRate[];
-    tariffPeriod: ProcessedTariffPeriod;
+    tariffPeriodEndDate: Date;
 }
 
 export interface ProcessedWarehouse {
     id?: string;
     geo_name: string;
     warehouse_name: string;
-}
-
-export interface ProcessedTariffPeriod {
-    id?: string;
-    start_date: Date;
-    end_date: Date | null;
 }
 
 export interface ProcessedBoxRate {
