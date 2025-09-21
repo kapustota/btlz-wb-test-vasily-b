@@ -5,13 +5,15 @@
     "main": "app.js",
     "type": "module",
     "scripts": {
-        "dev": "nodemon --watch src --ext ts --exec tsx src/app.ts",
+        "dev": "nodemon --watch src --ext ts --exec npx tsx src/app.ts",
         "watch:build": "tsc --build --force --verbose --watch",
-        "knex:dev": "tsx src/utils/knex.ts",
+        "knex:dev": "npx tsx src/utils/knex.ts",
+        "sync-rates:dev": "npx tsx src/cron/syncRates.ts",
 
         "build": "tsc --allowJs",
         "start": "node dist/app.js",
         "knex": "node dist/utils/knex.js",
+        "sync-rates": "node dist/cron/syncRates.js",
         
         "tsc:check": "tsc --allowJs --noEmit",
         "prettier": "prettier --config .prettierrc.json src/**/*.js --check",
@@ -36,6 +38,7 @@
         "googleapis": "^144.0.0",
         "knex": "^3.0.1",
         "log4js": "^6.9.1",
+        "node-cron": "^3.0.3",
         "pg": "^8.11.3",
         "zod": "^3.23.8"
     },
@@ -52,6 +55,7 @@
         "@types/jest": "^29.5.11",
         "@types/jsonwebtoken": "^9.0.8",
         "@types/knex": "^0.16.1",
+        "@types/node-cron": "^3.0.11",
         "@types/pg": "^8.11.10",
         "@types/uuid": "^10.0.0",
         "babel-jest": "^29.7.0",
